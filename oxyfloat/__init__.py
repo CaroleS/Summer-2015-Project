@@ -8,6 +8,7 @@ import pandas as pd
 import pydap.client
 import pydap.exceptions
 
+from pymongo import MongoClient
 from datetime import datetime, timedelta
 from thredds_crawler.crawl import Crawl
 from BeautifulSoup import BeautifulSoup
@@ -22,6 +23,8 @@ class OpenDAPServerError(Exception):
 
 
 class OxyFloat(object):
+    '''Collection of methods for working with Argo profiling float data.
+    '''
 
     logger = logging.getLogger(__name__)
     ch = logging.StreamHandler()
@@ -36,9 +39,18 @@ class OxyFloat(object):
             global_url='ftp://ftp.ifremer.fr/ifremer/argo/ar_index_global_meta.txt',
             thredds_url='http://tds0.ifremer.fr/thredds/catalog/CORIOLIS-ARGO-GDAC-OBS'):
 
-        '''Adjustable settings for OxyFloat: status_url, global_url,
-        thredds_url, debug.
+        '''Initialize OxyFloat object
+        
+        Args:
+            debug (bool): Turn on debug output, defaults to False
+            status_url (str): Source URL for Argo status data, defaults to
+                http://argo.jcommops.org/FTPRoot/Argo/Status/argo_all.txt
+            global_url (str): Source URL for DAC locations, defaults to
+                ftp://ftp.ifremer.fr/ifremer/argo/ar_index_global_meta.txt
+             thredds_url (str): Base URL for THREDDS Data Server, defaults to
+                http://tds0.ifremer.fr/thredds/catalog/CORIOLIS-ARGO-GDAC-OBS
 
+        Note:
         thredds_url='http://thredds.aodn.org.au/thredds/catalog/IMOS/Argo/dac/'
         worked on 27 July 2015, but doesn't work now - returns 500 errors.
         '''
@@ -51,8 +63,12 @@ class OxyFloat(object):
             self.logger.setLevel(logging.DEBUG)
 
     def get_oxy_floats(self, age=340):
-        '''Starting with listing of all floats convert the response so that
-        the data can be put into a Pandas DataFrame.
+        '''Starting with listing of all floats determine which floats have an
+        oxygen sensor, are not greylisted, and have more than a specified days
+        of data. Returns a list of float number strings.
+
+        Args:
+            age (int): Restrict to floats with data >= age, defaults to 340
         '''
         argo_all = self.status_url
         self.logger.debug('Reading data from %s', argo_all)
@@ -87,6 +103,9 @@ class OxyFloat(object):
 
     def get_dac_urls(self, desired_float_numbers):
         '''Return list of Data Assembly Centers where profile data are archived
+
+        Args:
+            desired_float_numbers (list[str]): List of strings of float numbers
         '''
         global_meta = self.global_url
         self.logger.debug('Reading data from %s', global_meta)
@@ -143,8 +162,9 @@ class OxyFloat(object):
 
         return urls
 
-    def get_profile_data(self, url):
-        '''Return a dictionary of lists of varaibles
+    def get_profile_data(self, url, surface_values_only=False):
+        '''Return a dictionary of tuples of lists of variables and their 
+        attributes.
         '''
         self.logger.debug('Opening %s', url)
         ds = pydap.client.open_url(url)
@@ -154,11 +174,19 @@ class OxyFloat(object):
             if v not in ds.keys():
                 raise RequiredVariableNotPresent(url + ' missing ' + v)
 
+        # Extract data casting numpy arrays into normal Python lists
         try:
-            p = ds['PRES_ADJUSTED'][0][0]
-            t = ds['TEMP_ADJUSTED'][0][0]
-            s = ds['PSAL_ADJUSTED'][0][0]
-            o = ds['DOXY_ADJUSTED'][0][0]
+            if surface_values_only:
+                p = ds['PRES_ADJUSTED'][0][0][0].tolist()
+                t = ds['TEMP_ADJUSTED'][0][0][0].tolist()
+                s = ds['PSAL_ADJUSTED'][0][0][0].tolist()
+                o = ds['DOXY_ADJUSTED'][0][0][0].tolist()
+            else:
+                p = ds['PRES_ADJUSTED'][0][0].tolist()
+                t = ds['TEMP_ADJUSTED'][0][0].tolist()
+                s = ds['PSAL_ADJUSTED'][0][0].tolist()
+                o = ds['DOXY_ADJUSTED'][0][0].tolist()
+
             lat = ds['LATITUDE'][0][0]
             lon = ds['LONGITUDE'][0][0]
         except pydap.exceptions.ServerError as e:
@@ -169,13 +197,53 @@ class OxyFloat(object):
         dt += timedelta(days=ds['JULD'][0][0])
 
         # Build a data structure that includes metadata for each variable
-        pd = {'p': (ds['PRES_ADJUSTED'].attributes, p),
-              't': (ds['TEMP_ADJUSTED'].attributes, t),
-              's': (ds['PSAL_ADJUSTED'].attributes, s),
-              'o': (ds['DOXY_ADJUSTED'].attributes, o),
-              'lat': (ds['LATITUDE'].attributes, lat),
-              'lon': (ds['LONGITUDE'].attributes, lon),
-              'dt': ({'name': 'time', 'units': 'UTC'}, dt)}
+        pd = {'p': [ds['PRES_ADJUSTED'].attributes, p],
+              't': [ds['TEMP_ADJUSTED'].attributes, t],
+              's': [ds['PSAL_ADJUSTED'].attributes, s],
+              'o': [ds['DOXY_ADJUSTED'].attributes, o],
+              'lat': [ds['LATITUDE'].attributes, lat],
+              'lon': [ds['LONGITUDE'].attributes, lon],
+              'dt': [{'name': 'time', 'units': 'UTC'}, dt]}
                   
         return pd
+
+    def get_data_for_float(self, dac_url, only_file=None, 
+            surface_values_only=False):
+        '''Given a dac_url return a list of hashes of data for each 
+        profile for the float specified in dac_url.  Example dac_url
+        for float 1900722:
+
+        http://tds0.ifremer.fr/thredds/catalog/CORIOLIS-ARGO-GDAC-OBSaoml/1900722/profiles/catalog.xml
+        '''
+        pd = []
+        for profile_url in sorted(self.get_profile_opendap_urls(dac_url)):
+            if only_file:
+                if not profile_url.endswith(only_file):
+                    continue
+
+            float = profile_url.split('/')[7]
+            prof = str(profile_url.split('/')[-1].split('.')[0].split('_')[1])
+            self.logger.info('Reading data from ' + profile_url[:20] + '...' +
+                       profile_url[-50:])
+            try:
+                d = self.get_profile_data(profile_url, 
+                        surface_values_only=surface_values_only)
+                pd.append({float: {prof: d}})
+            except RequiredVariableNotPresent as e:
+                self.logger.warn(e)
+            except OpenDAPServerError as e:
+                self.logger.warn(e)
+
+        return pd
+
+    def db_insert_float_data(self, float_data):
+        '''Insert/update document into Mongo database
+        '''
+        client = MongoClient()
+        db = client.oxyfloat
+        floats = db.floats
+
+        result = floats.insert_many(float_data)
+        self.logger.debug('IDs stored in mongodb floats database' + 
+                str(result.inserted_ids))
 

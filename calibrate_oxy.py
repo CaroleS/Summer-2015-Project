@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 
-import logging
+from pymongo import MongoClient
 from oxyfloat import OxyFloat, RequiredVariableNotPresent, OpenDAPServerError
+
+import logging
 
 logger = logging.getLogger(__name__)
 ch = logging.StreamHandler()
@@ -12,31 +14,29 @@ ch.setFormatter(formatter)
 logger.addHandler(ch)
 logger.setLevel(logging.DEBUG)
 
-of = OxyFloat(debug=False,
-        thredds_url='http://tds0.ifremer.fr/thredds/catalog/CORIOLIS-ARGO-GDAC-OBS')
-       
+of = OxyFloat(debug=True)
 
 # This takes a few minutes to build the list of the desired floats
 ##oga_float_nums = of.get_oxy_floats()
 
 # We can use a few numbers for testing
 logger.debug('Using test oga_float_nums...')
-oga_float_nums = ['1901378', '1900722', '2902124', '2902123', '6901776']
-test_file = 'R1901378_265.nc'
+oga_float_nums = ['1900650']
+test_file = 'D1900650_137.nc'
 
-for dac_url in of.get_dac_urls(oga_float_nums):
-    for profile_url in sorted(of.get_profile_opendap_urls(dac_url)):
-        if test_file:
-            if not profile_url.endswith(test_file):
-                continue
-        logger.info('Reading data from ...%s', profile_url[20:])
-        try:
-            float_data = of.get_profile_data(profile_url)
-        except RequiredVariableNotPresent as e:
-            logger.warn(e)
-        except OpenDAPServerError as e:
-            logger.warn(e)
-        else:
-            print float_data
+# Create a MongoDB document database for storing the profile data
+client = MongoClient()
+db = client.oxyfloat
+floats = db.floats
 
+# Crawl the Argo/Ifremer sites to load data into local database
+##for dac_url in of.get_dac_urls(oga_float_nums):
+    ##pd = of.get_data_for_float(dac_url, only_file=None)
+    ##if pd:
+    ##    of.db_insert_float_data(pd)
+
+# Pull out all of the latitude/longitude pairs
+geoms = db.floats.find(projection={'lat.lon':1})
+for geom in geoms:
+    print geom
 
